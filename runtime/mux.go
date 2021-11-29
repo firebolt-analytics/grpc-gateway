@@ -3,14 +3,22 @@ package runtime
 import (
 	"context"
 	"fmt"
+	"time"
+
 	"net/http"
 	"net/textproto"
 	"strings"
 
 	"github.com/golang/protobuf/proto"
+	"github.com/prometheus/client_golang/prometheus"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+)
+
+var (
+	apiDurationSecondsHistogramVec *prometheus.HistogramVec
+	apiCounter                     prometheus.Counter
 )
 
 // A HandlerFunc handles a specific pair of path pattern and HTTP method.
@@ -154,6 +162,8 @@ func WithLastMatchWins() ServeMuxOption {
 
 // NewServeMux returns a new ServeMux whose internal mapping is empty.
 func NewServeMux(opts ...ServeMuxOption) *ServeMux {
+	createAndRegisterMetrics()
+
 	serveMux := &ServeMux{
 		handlers:               make(map[string][]handler),
 		forwardResponseOptions: make([]func(context.Context, http.ResponseWriter, proto.Message) error, 0),
@@ -178,10 +188,46 @@ func NewServeMux(opts ...ServeMuxOption) *ServeMux {
 	return serveMux
 }
 
+func createAndRegisterMetrics() {
+	apiDurationSecondsHistogramVec = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: "firebolt",
+			Subsystem: "packrest",
+			Name:      "rest_method_duration_seconds",
+			Help:      "REST method runtime duration",
+		},
+		[]string{"method", "result"},
+	)
+
+	if err := prometheus.Register(apiDurationSecondsHistogramVec); err != nil {
+		if alreadyRegistered, ok := err.(prometheus.AlreadyRegisteredError); ok {
+			apiDurationSecondsHistogramVec = alreadyRegistered.ExistingCollector.(*prometheus.HistogramVec)
+		} else {
+			panic(err)
+		}
+	}
+
+	apiCounter = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "firebolt",
+			Subsystem: "packrest",
+			Name:      "rest_method_counter",
+			Help:      "REST method counter",
+		})
+
+	if err := prometheus.Register(apiCounter); err != nil {
+		if alreadyRegistered, ok := err.(prometheus.AlreadyRegisteredError); ok {
+			apiCounter = alreadyRegistered.ExistingCollector.(prometheus.Counter)
+		} else {
+			panic(err)
+		}
+	}
+}
+
 // Handle associates "h" to the pair of HTTP method and path pattern.
 func (s *ServeMux) Handle(meth string, pat Pattern, h HandlerFunc) {
 	if s.lastMatchWins {
-		s.handlers[meth] = append([]handler{handler{pat: pat, h: h}}, s.handlers[meth]...)
+		s.handlers[meth] = append([]handler{{pat: pat, h: h}}, s.handlers[meth]...)
 	} else {
 		s.handlers[meth] = append(s.handlers[meth], handler{pat: pat, h: h})
 	}
@@ -189,6 +235,9 @@ func (s *ServeMux) Handle(meth string, pat Pattern, h HandlerFunc) {
 
 // ServeHTTP dispatches the request to the first handler whose pattern matches to r.Method and r.Path.
 func (s *ServeMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	_since := time.Now()
+	apiCounter.Add(1)
+
 	ctx := r.Context()
 
 	path := r.URL.Path
@@ -197,8 +246,10 @@ func (s *ServeMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			_, outboundMarshaler := MarshalerForRequest(s, r)
 			sterr := status.Error(codes.InvalidArgument, http.StatusText(http.StatusBadRequest))
 			s.protoErrorHandler(ctx, s, outboundMarshaler, w, r, sterr)
+			apiDurationSecondsHistogramVec.WithLabelValues(r.Method, "missing /").Observe(time.Since(_since).Seconds())
 		} else {
 			OtherErrorHandler(w, r, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			apiDurationSecondsHistogramVec.WithLabelValues(r.Method, http.StatusText(http.StatusBadRequest)).Observe(time.Since(_since).Seconds())
 		}
 		return
 	}
@@ -210,8 +261,10 @@ func (s *ServeMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if s.protoErrorHandler != nil {
 			_, outboundMarshaler := MarshalerForRequest(s, r)
 			s.protoErrorHandler(ctx, s, outboundMarshaler, w, r, ErrUnknownURI)
+			apiDurationSecondsHistogramVec.WithLabelValues(r.Method, ErrUnknownURI.Error()).Observe(time.Since(_since).Seconds())
 		} else {
 			OtherErrorHandler(w, r, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			apiDurationSecondsHistogramVec.WithLabelValues(r.Method, http.StatusText(http.StatusNotFound)).Observe(time.Since(_since).Seconds())
 		}
 		return
 	} else if idx > 0 {
@@ -226,6 +279,7 @@ func (s *ServeMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				_, outboundMarshaler := MarshalerForRequest(s, r)
 				sterr := status.Error(codes.InvalidArgument, err.Error())
 				s.protoErrorHandler(ctx, s, outboundMarshaler, w, r, sterr)
+				apiDurationSecondsHistogramVec.WithLabelValues(r.Method, "InvalidArgument").Observe(time.Since(_since).Seconds())
 			} else {
 				OtherErrorHandler(w, r, err.Error(), http.StatusBadRequest)
 			}
@@ -238,6 +292,7 @@ func (s *ServeMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		h.h(w, r, pathParams)
+		apiDurationSecondsHistogramVec.WithLabelValues(r.Method, w.Header().Get("status")).Observe(time.Since(_since).Seconds())
 		return
 	}
 
@@ -259,19 +314,24 @@ func (s *ServeMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 						_, outboundMarshaler := MarshalerForRequest(s, r)
 						sterr := status.Error(codes.InvalidArgument, err.Error())
 						s.protoErrorHandler(ctx, s, outboundMarshaler, w, r, sterr)
+						apiDurationSecondsHistogramVec.WithLabelValues(r.Method, "InvalidArgument").Observe(time.Since(_since).Seconds())
 					} else {
 						OtherErrorHandler(w, r, err.Error(), http.StatusBadRequest)
+						apiDurationSecondsHistogramVec.WithLabelValues(r.Method, http.StatusText(http.StatusBadRequest)).Observe(time.Since(_since).Seconds())
 					}
 					return
 				}
 				h.h(w, r, pathParams)
+				apiDurationSecondsHistogramVec.WithLabelValues(r.Method, w.Header().Get("status")).Observe(time.Since(_since).Seconds())
 				return
 			}
 			if s.protoErrorHandler != nil {
 				_, outboundMarshaler := MarshalerForRequest(s, r)
 				s.protoErrorHandler(ctx, s, outboundMarshaler, w, r, ErrUnknownURI)
+				apiDurationSecondsHistogramVec.WithLabelValues(r.Method, ErrUnknownURI.Error()).Observe(time.Since(_since).Seconds())
 			} else {
 				OtherErrorHandler(w, r, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
+				apiDurationSecondsHistogramVec.WithLabelValues(r.Method, http.StatusText(http.StatusMethodNotAllowed)).Observe(time.Since(_since).Seconds())
 			}
 			return
 		}
@@ -280,8 +340,10 @@ func (s *ServeMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if s.protoErrorHandler != nil {
 		_, outboundMarshaler := MarshalerForRequest(s, r)
 		s.protoErrorHandler(ctx, s, outboundMarshaler, w, r, ErrUnknownURI)
+		apiDurationSecondsHistogramVec.WithLabelValues(r.Method, ErrUnknownURI.Error()).Observe(time.Since(_since).Seconds())
 	} else {
 		OtherErrorHandler(w, r, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+		apiDurationSecondsHistogramVec.WithLabelValues(r.Method, http.StatusText(http.StatusNotFound)).Observe(time.Since(_since).Seconds())
 	}
 }
 
